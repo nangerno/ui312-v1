@@ -1,0 +1,49 @@
+job: extension
+config:
+  name: last
+  process:
+  - type: diffusion_trainer
+    training_folder: /app/checkpoints
+    device: cuda
+    network:
+      type: lora
+      linear: 64
+      linear_alpha: 128
+      conv: 32
+      conv_alpha: 64
+    save:
+      dtype: bf16
+      save_every: 250
+      max_step_saves_to_keep: 4
+      save_format: diffusers
+    datasets:
+    - folder_path: /dataset/images
+      caption_ext: txt
+      cache_latents_to_disk: true
+      resolution: [512, 768, 1024]
+      is_reg: false
+    train:
+      batch_size: 4
+      steps: 450
+      lr: 3e-5
+      optimizer: adamw
+      gradient_checkpointing: true
+      noise_scheduler: flowmatch
+      timestep_type: weighted
+      dtype: bf16
+      optimizer_params:
+        weight_decay: 1e-5
+      ema_config:
+        use_ema: true
+        ema_decay: 0.995
+    model:
+      name_or_path: /cache/models
+      arch: zimage:turbo
+      quantize: true
+      qtype: qfloat8
+      quantize_te: true
+      qtype_te: qfloat8
+      assistant_lora_path: /cache/hf_cache/zimage_turbo_training_adapter_v2.safetensors
+meta:
+  name: zimage_lora
+  version: '1.0'
