@@ -1,9 +1,15 @@
+import os
+from pathlib import Path
+
 DEFAULT_IMAGE_DOCKERFILE_PATH = "dockerfiles/standalone-image-trainer.dockerfile"
 DEFAULT_TEXT_DOCKERFILE_PATH = "dockerfiles/standalone-text-trainer.dockerfile"
 DEFAULT_IMAGE_TOOLKIT_DOCKERFILE_PATH = "dockerfiles/standalone-image-toolkit-trainer.dockerfile"
-DEFAULT_TEXT_DOCKERFILE_PATH = "dockerfiles/standalone-text-trainer.dockerfile"
+
 TEMP_REPO_PATH = "/tmp/trainer/repos/"
-TASKS_FILE_PATH = "trainer/task_history.json"
+
+# Absolute path derived from this file's location so it is CWD-independent
+TASKS_FILE_PATH = str(Path(__file__).parent / "task_history.json")
+
 VOLUME_NAMES = ["checkpoints", "cache"]
 HF_UPLOAD_DOCKER_IMAGE = "diagonalge/hf-uploader:latest"
 TRAINER_DOWNLOADER_DOCKER_IMAGE = "diagonalge/trainer-downloader:latest"
@@ -12,17 +18,17 @@ IMAGE_TASKS_HF_SUBFOLDER_PATH = "checkpoints"
 VECTOR_URL = "http://localhost:8688"  # Vector http_server for logging
 IMAGE_BUILD_RETRIES = 3
 
-# Dynamic resource allocation based on GPU count
-# For 8xH100 with 1440GB RAM and 252 CPUs
-MEMORY_PER_GPU_GB = 110  # ~61% of 1440GB / 8 GPUs
-CPUS_PER_GPU = 24  # Conservative allocation leaving headroom
+# Dynamic resource allocation — configurable via environment variables.
+# Defaults tuned for an 8×H100 node (1440 GB RAM, 252 CPUs).
+MEMORY_PER_GPU_GB = int(os.getenv("MEMORY_PER_GPU_GB", "110"))
+CPUS_PER_GPU = int(os.getenv("CPUS_PER_GPU", "24"))
 
 CACHE_CLEANUP_CUTOFF_HOURS = 72
 STALE_TASK_GRACE_MINUTES = 10
 CONTAINER_START_MAX_RETRIES = 3
-CONTAINER_START_RETRY_DELAY_SECONDS = 3 
+CONTAINER_START_RETRY_DELAY_SECONDS = 3
 
-#TRAINING PATHS 
+# TRAINING PATHS
 CACHE_ROOT_PATH = "/cache"
 HUGGINGFACE_CACHE_PATH = "/cache/hf_cache"
 OUTPUT_CHECKPOINTS_PATH = "/app/checkpoints/"
@@ -34,8 +40,7 @@ IMAGE_CONTAINER_CONFIG_SAVE_PATH = "/dataset/configs"
 IMAGE_CONTAINER_IMAGES_PATH = "/dataset/images"
 TEXT_CONTAINER_SAVE_PATH = "/workspace/axolotl/outputs/"
 
-#Directories
-
+# Directories
 AXOLOTL_DIRECTORIES = {
     "data": "/workspace/axolotl/data",
     "prepared": "/workspace/axolotl/data_prepared",
@@ -43,7 +48,7 @@ AXOLOTL_DIRECTORIES = {
     "outputs": "/workspace/axolotl/outputs",
     "input": "/workspace/input_data",
     "root": "/workspace/axolotl",
-    "src": "/workspace/axolotl/src/"
+    "src": "/workspace/axolotl/src/",
 }
 
 WANDB_DIRECTORIES = [

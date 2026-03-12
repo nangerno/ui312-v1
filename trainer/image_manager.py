@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 
 import docker
@@ -33,22 +34,36 @@ from trainer.utils.logging_two import stream_container_logs
 from trainer.utils.logging_two import stream_image_build_logs
 
 
-# logger = get_logger(__name__)
+# ---------------------------------------------------------------------------
+# Background task tracking — prevents asyncio.Task objects from being
+# garbage-collected before they finish (fire-and-forget log streaming tasks).
+# ---------------------------------------------------------------------------
+_background_tasks: set[asyncio.Task] = set()
 
+
+def _track_task(task: asyncio.Task) -> asyncio.Task:
+    """Register a task so it is not GC'd before completion."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Resource helpers
+# ---------------------------------------------------------------------------
 
 def calculate_container_resources(gpu_ids: list[int]) -> tuple[str, int]:
-    """Calculate memory limit and CPU limit based on GPU count.
-
-    Returns:
-        tuple: (memory_limit_str, cpu_limit_nanocpus)
-    """
+    """Return (memory_limit_str, cpu_limit_nanocpus) scaled to the GPU count."""
     num_gpus = len(gpu_ids)
     memory_limit = f"{num_gpus * cst.MEMORY_PER_GPU_GB}g"
     cpu_limit_nanocpus = num_gpus * cst.CPUS_PER_GPU * 1_000_000_000
-
     logger.info(f"Allocating resources for {num_gpus} GPUs: {memory_limit} memory, {num_gpus * cst.CPUS_PER_GPU} CPUs")
     return memory_limit, cpu_limit_nanocpus
 
+
+# ---------------------------------------------------------------------------
+# Docker image build (with retry)
+# ---------------------------------------------------------------------------
 
 def build_docker_image(
     dockerfile_path: str,
@@ -58,28 +73,44 @@ def build_docker_image(
     tag: str = None,
     no_cache: bool = True,
 ) -> tuple[str, str | None]:
+    """Build a Docker image, retrying up to IMAGE_BUILD_RETRIES times on failure."""
     client: docker.DockerClient = docker.from_env()
 
     if tag is None:
         tag = f"standalone-image-trainer:{uuid.uuid4()}" if is_image_task else f"standalone-text-trainer:{uuid.uuid4()}"
 
-    logger.info(f"Building Docker image '{tag}', Dockerfile path: {dockerfile_path}, Context Path: {context_path}...")
+    logger.info(f"Building Docker image '{tag}', Dockerfile: {dockerfile_path}, Context: {context_path}...")
 
-    try:
-        build_output = client.api.build(
-            path=context_path,
-            dockerfile=dockerfile_path,
-            tag=tag,
-            nocache=no_cache,
-            decode=True,
-        )
-        stream_image_build_logs(build_output, logger=logger, log_context=log_labels)
+    last_error: Exception | None = None
+    for attempt in range(cst.IMAGE_BUILD_RETRIES):
+        try:
+            build_output = client.api.build(
+                path=context_path,
+                dockerfile=dockerfile_path,
+                tag=tag,
+                nocache=no_cache,
+                decode=True,
+            )
+            stream_image_build_logs(build_output, logger=logger, log_context=log_labels)
+            logger.info("Docker image built successfully.", extra=log_labels)
+            return tag, None
 
-        logger.info("Docker image built successfully.", extra=log_labels)
-        return tag, None
-    except (BuildError, APIError) as e:
-        logger.error(f"Docker build failed: {str(e)}", extra=log_labels)
-        return None, str(e)
+        except (BuildError, APIError) as e:
+            last_error = e
+            if attempt < cst.IMAGE_BUILD_RETRIES - 1:
+                delay = 5 * (attempt + 1)
+                logger.warning(
+                    f"Docker build attempt {attempt + 1}/{cst.IMAGE_BUILD_RETRIES} failed, "
+                    f"retrying in {delay}s: {str(e)[:150]}",
+                    extra=log_labels,
+                )
+                time.sleep(delay)
+
+    logger.error(
+        f"Docker build failed after {cst.IMAGE_BUILD_RETRIES} attempts: {str(last_error)}",
+        extra=log_labels,
+    )
+    return None, str(last_error)
 
 
 def delete_image_and_cleanup(tag: str):
@@ -100,6 +131,10 @@ def delete_image_and_cleanup(tag: str):
         logger.error(f"Cleanup failed: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Container runners
+# ---------------------------------------------------------------------------
+
 async def run_trainer_container_image(
     task_id: str,
     tag: str,
@@ -116,29 +151,19 @@ async def run_trainer_container_image(
     client: docker.DockerClient = docker.from_env()
 
     command: list[str] = [
-        "--task-id",
-        task_id,
-        "--model",
-        model,
-        "--dataset-zip",
-        dataset_zip,
-        "--model-type",
-        model_type,
-        "--expected-repo-name",
-        expected_repo_name,
-        "--hours-to-complete",
-        str(hours_to_complete)
+        "--task-id", task_id,
+        "--model", model,
+        "--dataset-zip", dataset_zip,
+        "--model-type", model_type,
+        "--expected-repo-name", expected_repo_name,
+        "--hours-to-complete", str(hours_to_complete),
     ]
 
     if trigger_word:
         command += ["--trigger-word", trigger_word]
 
     container_name = f"image-trainer-{uuid.uuid4().hex}"
-
-    # Calculate resources based on GPU count
     memory_limit, cpu_limit_nanocpus = calculate_container_resources(gpu_ids)
-
-    # Set shared memory size based on GPU count
     shm_size = "16g" if len(gpu_ids) >= 4 else "8g"
 
     max_retries = cst.CONTAINER_START_MAX_RETRIES
@@ -162,18 +187,21 @@ async def run_trainer_container_image(
                 device_requests=[docker.types.DeviceRequest(device_ids=[str(i) for i in gpu_ids], capabilities=[["gpu"]])],
                 security_opt=["no-new-privileges"],
                 cap_drop=["ALL"],
-                network_mode="bridge",  # Changed from "none" to allow log shipping
+                network_mode="bridge",
                 environment={"TRANSFORMERS_CACHE": cst.HUGGINGFACE_CACHE_PATH},
                 detach=True,
             )
 
-            log_streaming_task = asyncio.create_task(asyncio.to_thread(stream_container_logs, container, get_all_context_tags()))
+            _track_task(asyncio.create_task(
+                asyncio.to_thread(stream_container_logs, container, get_all_context_tags())
+            ))
             return container
 
         except Exception as e:
             if attempt < max_retries - 1:
                 logger.warning(
-                    f"Error starting container (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s: {str(e)[:150]}",
+                    f"Error starting container (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {retry_delay}s: {str(e)[:150]}",
                     extra=log_labels,
                 )
                 await asyncio.sleep(retry_delay)
@@ -201,30 +229,18 @@ async def run_trainer_container_text(
     environment = build_wandb_env(task_id, hotkey)
 
     command: list[str] = [
-        "--task-id",
-        task_id,
-        "--model",
-        model,
-        "--dataset",
-        dataset,
-        "--dataset-type",
-        json.dumps(dataset_type.model_dump()),
-        "--task-type",
-        task_type,
-        "--file-format",
-        file_format,
-        "--expected-repo-name",
-        expected_repo_name,
-        "--hours-to-complete",
-        str(hours_to_complete),
+        "--task-id", task_id,
+        "--model", model,
+        "--dataset", dataset,
+        "--dataset-type", json.dumps(dataset_type.model_dump()),
+        "--task-type", task_type,
+        "--file-format", file_format,
+        "--expected-repo-name", expected_repo_name,
+        "--hours-to-complete", str(hours_to_complete),
     ]
 
     container_name = f"text-trainer-{uuid.uuid4().hex}"
-
-    # Calculate resources based on GPU count
     memory_limit, cpu_limit_nanocpus = calculate_container_resources(gpu_ids)
-
-    # Set shared memory size based on GPU count
     shm_size = "16g" if len(gpu_ids) >= 4 else "8g"
 
     max_retries = cst.CONTAINER_START_MAX_RETRIES
@@ -249,17 +265,20 @@ async def run_trainer_container_text(
                 security_opt=["no-new-privileges"],
                 cap_drop=["ALL"],
                 detach=True,
-                network_mode="bridge",  # Changed from "none" to allow log shipping
+                network_mode="bridge",
                 environment=environment,
             )
 
-            log_streaming_task = asyncio.create_task(asyncio.to_thread(stream_container_logs, container, get_all_context_tags()))
+            _track_task(asyncio.create_task(
+                asyncio.to_thread(stream_container_logs, container, get_all_context_tags())
+            ))
             return container
 
         except Exception as e:
             if attempt < max_retries - 1:
                 logger.warning(
-                    f"Error starting container (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s: {str(e)[:150]}",
+                    f"Error starting container (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {retry_delay}s: {str(e)[:150]}",
                     extra=log_labels,
                 )
                 await asyncio.sleep(retry_delay)
@@ -270,12 +289,11 @@ async def run_trainer_container_text(
 
 async def create_volumes_if_dont_exist():
     client: docker.DockerClient = docker.from_env()
-    volume_names = cst.VOLUME_NAMES
-    for volume_name in volume_names:
+    for volume_name in cst.VOLUME_NAMES:
         try:
-            volume = client.volumes.get(volume_name)
+            client.volumes.get(volume_name)
         except docker.errors.NotFound:
-            volume = client.volumes.create(name=volume_name)
+            client.volumes.create(name=volume_name)
             logger.info(f"Volume '{volume_name}' created.")
 
 
@@ -292,18 +310,13 @@ def run_downloader_container(
     client = docker.from_env()
 
     command = [
-        "--task-id",
-        task_id,
-        "--model",
-        model,
-        "--task-type",
-        task_type,
-        "--dataset",
-        dataset_url,
+        "--task-id", task_id,
+        "--model", model,
+        "--task-type", task_type,
+        "--dataset", dataset_url,
     ]
     if file_format:
         command += ["--file-format", file_format]
-
     if model_type:
         command += ["--model-type", model_type]
 
@@ -371,7 +384,7 @@ async def upload_repo_to_hf(
         environment = {
             "HUGGINGFACE_TOKEN": huggingface_token,
             "HUGGINGFACE_USERNAME": huggingface_username,
-            "WANDB_TOKEN": wandb_token or None,
+            "WANDB_TOKEN": wandb_token,
             "WANDB_LOGS_PATH": f"{cst.WANDB_LOGS_DIR}/{task_id}_{hotkey}",
             "LOCAL_FOLDER": local_container_folder,
             "MODEL": model,
@@ -399,12 +412,15 @@ async def upload_repo_to_hf(
             name=container_name,
         )
 
-        log_streaming_task = asyncio.create_task(asyncio.to_thread(stream_container_logs, container, get_all_context_tags()))
+        _track_task(asyncio.create_task(
+            asyncio.to_thread(stream_container_logs, container, get_all_context_tags())
+        ))
 
-        result = container.wait()
+        # Offload the blocking container.wait() to a thread
+        result = await asyncio.to_thread(container.wait)
         logs = container.logs().decode("utf-8", errors="ignore")
         exit_code = result.get("StatusCode", -1)
-        wandb_url = None
+
         if wandb_token:
             m = re.search(r"https://wandb\.ai/\S+", logs)
             wandb_url = m.group(0) if m else None
@@ -432,6 +448,10 @@ async def upload_repo_to_hf(
                 logger.warning(f"Failed to remove upload container {container.name}: {cleanup_err}")
 
 
+# ---------------------------------------------------------------------------
+# Task type resolution
+# ---------------------------------------------------------------------------
+
 def get_task_type(request: TrainerProxyRequest) -> TaskType:
     training_data = request.training_data
 
@@ -454,17 +474,20 @@ def get_task_type(request: TrainerProxyRequest) -> TaskType:
 
 
 def get_dockerfile_path(task_type: TaskType, training_data, local_repo_path: str) -> str:
-    """Get the appropriate dockerfile path based on task type and model type"""
+    """Return the correct Dockerfile path for the given task type and model."""
     if task_type == TaskType.IMAGETASK:
         model_type = training_data.model_type
         if model_type in [ImageModelType.Z_IMAGE, ImageModelType.QWEN_IMAGE]:
             return f"{local_repo_path}/{cst.DEFAULT_IMAGE_TOOLKIT_DOCKERFILE_PATH}"
         else:
             return f"{local_repo_path}/{cst.DEFAULT_IMAGE_DOCKERFILE_PATH}"
- 
     else:
         return f"{local_repo_path}/{cst.DEFAULT_TEXT_DOCKERFILE_PATH}"
 
+
+# ---------------------------------------------------------------------------
+# Main training task
+# ---------------------------------------------------------------------------
 
 async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
     cancelled_exc: asyncio.CancelledError | None = None
@@ -477,7 +500,8 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
         tag = None
         timeout_seconds = int(training_data.hours_to_complete * 3600)
         task_type = get_task_type(task)
-        training_data.hours_to_complete = int(training_data.hours_to_complete)
+        # NOTE: keep hours_to_complete as a float so the training container can use
+        # the full budget for time-based step scaling (e.g. 1.5 h → 1.5, not 1).
         await create_volumes_if_dont_exist()
 
         log_labels = {
@@ -511,8 +535,7 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
         )
 
         if download_status == 0:
-            message = "Download container completed successfully"
-            await log_task(training_data.task_id, task.hotkey, message)
+            await log_task(training_data.task_id, task.hotkey, "Download container completed successfully")
         else:
             message = f"[ERROR] Download container failed | ExitCode: {download_status} | LastError: {exc}"
             await log_task(training_data.task_id, task.hotkey, message)
@@ -573,9 +596,13 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
             )
 
         await log_task(training_data.task_id, task.hotkey, f"Container started: {container.name}")
-        await log_task(training_data.task_id, task.hotkey, f"Waiting for container to finish (timeout={timeout_seconds})...")
+        await log_task(
+            training_data.task_id, task.hotkey,
+            f"Waiting for container to finish (timeout={timeout_seconds}s)...",
+        )
+
         wait_task = asyncio.create_task(asyncio.to_thread(container.wait))
-        done, pending = await asyncio.wait({wait_task}, timeout=timeout_seconds)
+        done, _ = await asyncio.wait({wait_task}, timeout=timeout_seconds)
         await log_task(training_data.task_id, task.hotkey, "Container wait completed or timed out.")
 
         if wait_task in done:
@@ -592,12 +619,19 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
                     log_message = f"[ERROR] Training container failed | ExitCode: {status_code} | LastError: {error_message}"
                     await log_task(training_data.task_id, task.hotkey, log_message)
                     logger.error(f"Training container failed: {error_message}", extra=log_labels)
-                await complete_task(training_data.task_id, task.hotkey, success=success)
+                # Mark failed immediately so callers polling task status see it right away;
+                # _final_cleanup will call complete_task again after upload handling.
+                await complete_task(training_data.task_id, task.hotkey, success=False)
                 await log_task(training_data.task_id, task.hotkey, f"Training failed with status code {status_code}")
         else:
-            await log_task(training_data.task_id, task.hotkey, f"Timeout reached ({timeout_seconds}s). Killing container...")
+            # Timeout reached — training ran for the full allocated time (time-boxed training).
+            # The container is still running and will be killed in _final_cleanup.
+            # We treat this as a successful run so the partial/completed checkpoint is uploaded.
+            await log_task(
+                training_data.task_id, task.hotkey,
+                f"Timeout reached ({timeout_seconds}s). Container will be stopped and output uploaded.",
+            )
             success = True
-            await complete_task(training_data.task_id, task.hotkey, success=success)
 
     except asyncio.CancelledError as cancel:
         cancel_log_message = "[INFO] Training cancelled."
@@ -623,7 +657,6 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
                         container.kill()
                     container.remove(force=True)
                     await log_task(training_data.task_id, task.hotkey, f"Container {container.name} cleaned up.")
-
                 except Exception as cleanup_err:
                     await log_task(training_data.task_id, task.hotkey, f"Error during container cleanup: {cleanup_err}")
 
@@ -649,7 +682,6 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
                         wandb_token=wandb_token,
                         path_in_repo=path_in_repo,
                     )
-
                     await log_task(training_data.task_id, task.hotkey, "Repo uploaded successfully.")
                 except Exception as upload_err:
                     log_message = f"[ERROR] Upload container failed | ExitCode: Unknown | LastError: {upload_err}"

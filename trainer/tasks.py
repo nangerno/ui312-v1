@@ -38,7 +38,7 @@ async def start_task(task: TrainerProxyRequest) -> tuple[str, str]:
             return task_id, hotkey
 
         log_entry = TrainerTaskLog(
-            **task.dict(),
+            **task.model_dump(),
             status=TaskStatus.TRAINING,
             started_at=datetime.utcnow(),
             finished_at=None,

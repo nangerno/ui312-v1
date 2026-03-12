@@ -100,13 +100,13 @@ def detect_styles_in_prompts(prompts: List[str], style_list=IMAGE_STYLES):
     style_matches = defaultdict(int)
     total_prompts = len(prompts)
     
+    # Pre-sort once by length (descending) to prioritize longer/more specific matches
+    sorted_styles = sorted(style_list, key=len, reverse=True)
+
     for prompt in prompts:
         prompt_lower = prompt.lower()
         matched_styles = set()  # Track styles matched in this prompt to avoid double counting
-        
-        # Sort styles by length (descending) to prioritize longer/more specific matches
-        sorted_styles = sorted(style_list, key=len, reverse=True)
-        
+
         for style in sorted_styles:
             patterns = style_patterns[style]
             

@@ -32,25 +32,30 @@ load_task_history()
 
 
 async def verify_orchestrator_ip(request: Request):
-    # """Verify request comes from orchestrator IP"""
-    # client_ip = request.client.host
-    # allowed_ips_str = os.getenv("ORCHESTRATOR_IPS", os.getenv("ORCHESTRATOR_IP", "185.141.218.59"))
-    # allowed_ips = [ip.strip() for ip in allowed_ips_str.split(",")]
-    # allowed_ips.append("127.0.0.1")  # Always allow localhost
+    """Verify that the request originates from a known orchestrator IP address.
 
-    # if client_ip not in allowed_ips:
-    #     raise HTTPException(status_code=403, detail="Access forbidden")
-    # return client_ip
-    return
+    Allowed IPs are read from the ORCHESTRATOR_IPS (comma-separated) or
+    ORCHESTRATOR_IP environment variable.  Localhost is always allowed.
+    """
+    client_ip = request.client.host
+    allowed_ips_str = os.getenv("ORCHESTRATOR_IPS", os.getenv("ORCHESTRATOR_IP", "185.141.218.59"))
+    allowed_ips = [ip.strip() for ip in allowed_ips_str.split(",")]
+    allowed_ips.append("127.0.0.1")  # always allow localhost
+
+    if client_ip not in allowed_ips:
+        logger.warning(f"Blocked request from unauthorized IP: {client_ip}")
+        raise HTTPException(status_code=403, detail="Access forbidden")
+
+    return client_ip
 
 
 async def start_training(req: TrainerProxyRequest) -> JSONResponse:
     if not are_gpus_available(req.gpu_ids):
         raise HTTPException(
             status_code=409,
-            detail=f"GPU conflict detected. Requested GPUs are already in use by running training tasks."
+            detail="GPU conflict detected. Requested GPUs are already in use by running training tasks.",
         )
-    
+
     await start_task(req)
 
     try:
@@ -83,8 +88,7 @@ async def start_training(req: TrainerProxyRequest) -> JSONResponse:
 
 
 async def get_available_gpus() -> list[GPUInfo]:
-    gpu_info = await get_gpu_info()
-    return gpu_info
+    return await get_gpu_info()
 
 
 async def get_task_details(task_id: str, hotkey: str) -> TrainerTaskLog:
@@ -95,10 +99,12 @@ async def get_task_details(task_id: str, hotkey: str) -> TrainerTaskLog:
 
 
 async def get_recent_tasks_list(hours: int) -> list[TrainerTaskLog]:
-    tasks = get_recent_tasks(hours)
-    if not tasks:
-        raise HTTPException(status_code=404, detail=f"Tasks not found in the last {hours} hours.")
-    return tasks
+    """Return tasks active within the given time window.
+
+    Returns an empty list (HTTP 200) rather than 404 when no tasks are found,
+    which is the correct REST behaviour for a collection endpoint.
+    """
+    return get_recent_tasks(hours)
 
 
 def factory_router() -> APIRouter:
@@ -112,5 +118,7 @@ def factory_router() -> APIRouter:
     router.add_api_route(
         GET_RECENT_TASKS_ENDPOINT, get_recent_tasks_list, methods=["GET"], dependencies=[Depends(verify_orchestrator_ip)]
     )
-    router.add_api_route(TASK_DETAILS_ENDPOINT, get_task_details, methods=["GET"], dependencies=[Depends(verify_orchestrator_ip)])
+    router.add_api_route(
+        TASK_DETAILS_ENDPOINT, get_task_details, methods=["GET"], dependencies=[Depends(verify_orchestrator_ip)]
+    )
     return router

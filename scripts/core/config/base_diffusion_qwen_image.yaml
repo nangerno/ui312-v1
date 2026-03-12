@@ -22,7 +22,9 @@ config:
       is_reg: false
     train:
       batch_size: 4
-      steps: 3000
+      # steps is overridden at runtime: base 700 steps/h, capped at 1600.
+      # The old 3000-step default took ~2.5 h and was always killed for shorter tasks.
+      steps: 700
       lr: 3e-5
       optimizer: adamw
       gradient_checkpointing: true
@@ -30,14 +32,18 @@ config:
       noise_scheduler: flowmatch
       timestep_type: weighted
       dtype: bf16
-      cache_text_embeddings: true
+      # Disable text-embedding cache so the text encoder is trained end-to-end
+      # with LoRA — this allows the model to bind the trigger word to the visual
+      # concept, which directly lowers reconstruction loss on test prompts.
+      cache_text_embeddings: false
       train_unet: true
-      train_text_encoder: false
+      train_text_encoder: true
       optimizer_params:
         weight_decay: 1e-5
       ema_config:
         use_ema: true
-        ema_decay: 0.995
+        # 0.999: smoother averaging → better generalisation at any step count
+        ema_decay: 0.999
       do_cfg: true
       cfg_scale: 5.0
     model:

@@ -72,6 +72,7 @@ class TrainRequestImage(TrainRequest):
         min_length=1,
     )
     model_type: ImageModelType = ImageModelType.SDXL
+    trigger_word: str | None = None
 
 
 class TrainerProxyRequest(BaseModel):
@@ -88,7 +89,7 @@ class TrainerTaskLog(TrainerProxyRequest):
     started_at: datetime | None
     finished_at: datetime | None
     wandb_url: str | None = None
-    logs: list[str] = []
+    logs: list[str] = Field(default_factory=list)
 
 
 class TrainResponse(BaseModel):

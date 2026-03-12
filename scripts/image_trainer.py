@@ -108,7 +108,7 @@ def load_lrs_config(model_type: str, is_style: bool) -> dict:
         return None
 
 
-def create_config(task_id, model_path, model_name, model_type, expected_repo_name, trigger_word: str | None = None):
+def create_config(task_id, model_path, model_name, model_type, expected_repo_name, trigger_word: str | None = None, hours_to_complete: float = 1.0):
     """Get the training data directory"""
     train_data_dir = train_paths.get_image_training_images_dir(task_id)
 
@@ -136,7 +136,30 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
 
                 if trigger_word:
                     process['trigger_word'] = trigger_word
-        
+
+                # -------------------------------------------------------
+                # Time-based step scaling: use the full time budget.
+                # Each model has different throughput (steps/second), so
+                # we scale relative to a 1-hour baseline.
+                # -------------------------------------------------------
+                if 'train' in process:
+                    arch = process.get('model', {}).get('arch', '')
+                    is_qwen = 'qwen' in arch.lower()
+                    if is_qwen:
+                        # Qwen: ~3 s/step → 700 steps/h; cap 1 600
+                        base_steps = 700
+                        max_steps_cap = 1600
+                    else:
+                        # Z-Image: ~1.5 s/step → 1 100 steps/h (was 450 fixed)
+                        base_steps = 500
+                        max_steps_cap = 1200
+                    scaled_steps = int(min(max(base_steps, base_steps * hours_to_complete), max_steps_cap))
+                    process['train']['steps'] = scaled_steps
+                    # Save ~8 checkpoints during the run
+                    if 'save' in process:
+                        process['save']['save_every'] = max(25, scaled_steps // 8)
+                    print(f"[time-scaling] {arch}: steps={scaled_steps}, hours={hours_to_complete:.2f}", flush=True)
+
         config_path = os.path.join(train_cst.IMAGE_CONTAINER_CONFIG_SAVE_PATH, f"{task_id}.yaml")
         save_config(config, config_path)
         print(f"Created ai-toolkit config at {config_path}", flush=True)
@@ -301,6 +324,24 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
             config["network_alpha"] = network_config["network_alpha"]
             config["network_args"] = network_config["network_args"]
 
+        # -------------------------------------------------------
+        # Time-based scaling
+        # -------------------------------------------------------
+        if model_type == "flux":
+            # Lion on H100: ~0.8 s/step → ~450 steps/h at batch_size=4.
+            # Use 80 % of budget to leave room for dataset prep + upload.
+            base_steps = 400
+            scaled_steps = int(min(max(base_steps, base_steps * hours_to_complete), 1500))
+            config["max_train_steps"] = scaled_steps
+            # ~8 saves during the run; prefer step-based saves for step-trained models.
+            config.pop("save_every_n_epochs", None)
+            config["save_every_n_steps"] = max(50, scaled_steps // 8)
+            print(f"[time-scaling] flux: max_train_steps={scaled_steps}, hours={hours_to_complete:.2f}", flush=True)
+        elif model_type == "sdxl":
+            # Epochs come from LRS config; ensure we save ~8 times so a timeout
+            # doesn't discard too much progress.
+            total_epochs = config.get("max_train_epochs", 25)
+            config["save_every_n_epochs"] = max(1, total_epochs // 8)
 
         # Old size config search removed as requested
         if dataset_size > 0 and not size_config_loaded:
@@ -735,6 +776,7 @@ async def main():
         args.model_type,
         args.expected_repo_name,
         args.trigger_word,
+        args.hours_to_complete,
     )
 
     # Run training with retry logic

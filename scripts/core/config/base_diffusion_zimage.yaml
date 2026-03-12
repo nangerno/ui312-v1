@@ -24,7 +24,8 @@ config:
       is_reg: false
     train:
       batch_size: 4
-      steps: 450
+      # steps is overridden at runtime: base 500 steps/h, capped at 1200.
+      steps: 500
       lr: 3e-5
       optimizer: adamw
       gradient_checkpointing: true
@@ -35,7 +36,8 @@ config:
         weight_decay: 1e-5
       ema_config:
         use_ema: true
-        ema_decay: 0.995
+        # 0.999 vs 0.995: smoother averaging → better generalisation at any step count
+        ema_decay: 0.999
     model:
       name_or_path: /cache/models
       arch: zimage:turbo

@@ -1,12 +1,17 @@
-from pathlib import Path
 import os
+from pathlib import Path
+
 import trainer.constants as train_cst
+from trainer.utils.logging_two import get_logger
 from trainer.utils.style_detection import detect_styles_in_prompts
 from core.models.utility_models import DpoDatasetType
 from core.models.utility_models import GrpoDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import ChatTemplateDatasetType
 from core.models.utility_models import ImageModelType
+
+logger = get_logger(__name__)
+
 
 def get_checkpoints_output_path(task_id: str, repo_name: str) -> str:
     return str(Path(train_cst.OUTPUT_CHECKPOINTS_PATH) / task_id / repo_name)
@@ -35,7 +40,7 @@ def get_image_training_config_template_path(model_type: str, train_data_dir: str
                     prompts.append(prompt)
 
         styles = detect_styles_in_prompts(prompts)
-        print(f"Styles: {styles}")
+        logger.debug(f"Detected styles: {styles}")
 
         if styles:
             return str(Path(train_cst.IMAGE_CONTAINER_CONFIG_TEMPLATE_PATH) / "base_diffusion_sdxl_style.toml"), True
